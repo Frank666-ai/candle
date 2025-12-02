@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+ccxt
+pandas
+numpy
+python-dotenv
+websockets
+pydantic
+httpx

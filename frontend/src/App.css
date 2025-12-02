@@ -1,0 +1,45 @@
+#root {
+  width: 100%;
+  height: 100%;
+}
+
+.ant-layout {
+  background: #000000 !important;
+}
+
+.ant-layout-header {
+  background: #141414 !important;
+  border-bottom: 1px solid #303030;
+  height: 64px;
+  line-height: 64px;
+}
+
+/* 卡片深色样式微调 */
+.ant-card {
+  background: #141414 !important;
+  border: 1px solid #303030 !important;
+}
+
+.ant-card-head {
+  border-bottom: 1px solid #303030 !important;
+  color: #ececec !important;
+}
+
+.ant-list-item {
+  color: #d9d9d9 !important;
+}
+
+/* 输入框等组件样式 */
+.ant-input-number, .ant-select-selector {
+  background-color: #1f1f1f !important;
+  border-color: #434343 !important;
+  color: #d9d9d9 !important;
+}
+
+.ant-tabs-tab {
+  color: #a6a6a6 !important;
+}
+
+.ant-tabs-tab-active .ant-tabs-tab-btn {
+  color: #F0B90B !important;
+}
