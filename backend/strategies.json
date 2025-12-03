@@ -1,0 +1,18 @@
+{
+  "7fa7eb3b-63ce-4a2f-8f11-8c104d70dd67": {
+    "config": {
+      "exchange": "binance",
+      "symbol": "SOL/USDT",
+      "marketType": "future",
+      "timeframe": "1h",
+      "ratio": 0.67,
+      "confluence": 1,
+      "tp": 1.5,
+      "sl": 1,
+      "leverage": 5,
+      "amount": 10
+    },
+    "start_time": "2025-12-03T21:45:33.622808",
+    "status": "running"
+  }
+}

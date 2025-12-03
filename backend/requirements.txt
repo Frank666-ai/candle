@@ -1,9 +1,11 @@
 fastapi
 uvicorn
-ccxt
+ccxt>=4.0.0
 pandas
 numpy
 python-dotenv
 websockets
 pydantic
 httpx
+requests
+python-binance

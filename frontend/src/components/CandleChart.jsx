@@ -3,94 +3,136 @@ import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts';
 
 export const CandleChart = ({ data, colors = {} }) => {
     const chartContainerRef = useRef();
-    const chartRef = useRef();
-    const seriesRef = useRef();
+    const chartRef = useRef(null);
+    const seriesRef = useRef(null);
 
     useEffect(() => {
         if (!chartContainerRef.current) return;
 
-        // 初始创建图表
-        const chart = createChart(chartContainerRef.current, {
-            layout: {
-                background: { type: ColorType.Solid, color: '#141414' },
-                textColor: '#d1d4dc',
-            },
-            grid: {
-                vertLines: { color: 'rgba(42, 46, 57, 0.5)' },
-                horzLines: { color: 'rgba(42, 46, 57, 0.5)' },
-            },
-            width: chartContainerRef.current.clientWidth,
-            height: 500,
-            timeScale: {
-                timeVisible: true,
-                secondsVisible: false,
-            },
-        });
-        chartRef.current = chart;
+        // 0. 清理旧图表实例
+        if (chartRef.current) {
+            try {
+                chartRef.current.remove();
+            } catch (e) {
+                // 忽略移除错误
+            }
+            chartRef.current = null;
+        }
 
-        // 添加 K 线 Series
+        // 1. 创建图表实例
         try {
-             // 使用 v5 推荐的 addSeries 方法，避免 addCandlestickSeries 可能不存在的问题
-             const newSeries = chart.addSeries(CandlestickSeries, {
+            const chart = createChart(chartContainerRef.current, {
+                layout: {
+                    background: { type: ColorType.Solid, color: '#141414' },
+                    textColor: '#d1d4dc',
+                },
+                grid: {
+                    vertLines: { color: 'rgba(42, 46, 57, 0.2)' },
+                    horzLines: { color: 'rgba(42, 46, 57, 0.2)' },
+                },
+                width: chartContainerRef.current.clientWidth,
+                height: 500,
+                timeScale: {
+                    timeVisible: true,
+                    secondsVisible: false,
+                    borderColor: '#2B2B43',
+                },
+                rightPriceScale: {
+                    borderColor: '#2B2B43',
+                },
+            });
+            
+            chartRef.current = chart;
+
+            // 2. 添加 K 线 Series
+            // 使用 lightweight-charts v5 标准 API: addSeries(CandlestickSeries, options)
+            const newSeries = chart.addSeries(CandlestickSeries, {
                 upColor: '#26a69a',
                 downColor: '#ef5350',
                 borderVisible: false,
                 wickUpColor: '#26a69a',
                 wickDownColor: '#ef5350',
             });
-            seriesRef.current = newSeries;
             
-            // 初始数据设置
+            seriesRef.current = newSeries;
+
+            // 3. 初始数据设置 (带去重和排序)
             if (data && data.length > 0) {
-                newSeries.setData(data);
-                chart.timeScale().fitContent();
+                processAndSetData(newSeries, data, chart);
             }
-        } catch (e) {
-            console.error("Series creation failed:", e);
+        } catch (err) {
+            console.error("Chart initialization failed:", err);
         }
 
-        // 响应式大小调整
-        const resizeObserver = new ResizeObserver(entries => {
-            if (!chartRef.current) return;
-            
-            for (const entry of entries) {
-                const { width, height } = entry.contentRect;
-                chartRef.current.applyOptions({ width, height });
+        // 4. 响应式大小调整
+        const handleResize = () => {
+            if (chartContainerRef.current && chartRef.current) {
+                chartRef.current.applyOptions({ 
+                    width: chartContainerRef.current.clientWidth 
+                });
             }
-        });
+        };
 
-        resizeObserver.observe(chartContainerRef.current);
+        window.addEventListener('resize', handleResize);
 
         return () => {
-            resizeObserver.disconnect();
+            window.removeEventListener('resize', handleResize);
             if (chartRef.current) {
-                chartRef.current.remove();
+                try {
+                    chartRef.current.remove();
+                } catch(e) {}
                 chartRef.current = null;
             }
         };
-    }, []); // 仅在挂载时执行一次初始化
+    }, []); 
 
     // 数据更新监听
     useEffect(() => {
         if (seriesRef.current && data && data.length > 0) {
-            try {
-                 seriesRef.current.setData(data);
-            } catch (e) {
-                console.error("Data update error:", e);
-            }
-        } else {
-            // console.log("No data to render or series not ready");
+            processAndSetData(seriesRef.current, data);
         }
     }, [data]);
 
+    // 辅助函数：处理数据去重、排序并设置
+    const processAndSetData = (series, rawData, chartInstance = null) => {
+        try {
+            const sortedData = [...rawData]
+                .filter(item => item && item.time != null)
+                .sort((a, b) => a.time - b.time)
+                .map(item => ({
+                    time: item.time,
+                    open: Number(item.open),
+                    high: Number(item.high),
+                    low: Number(item.low),
+                    close: Number(item.close),
+                }));
+            
+            // 严格去重：同一时间戳只保留最后一个
+            const uniqueMap = new Map();
+            for (const item of sortedData) {
+                uniqueMap.set(item.time, item);
+            }
+            const uniqueData = Array.from(uniqueMap.values());
+
+            if (uniqueData.length > 0) {
+                series.setData(uniqueData);
+                if (chartInstance) {
+                    chartInstance.timeScale().fitContent();
+                }
+            }
+        } catch (e) {
+            console.error("Data processing error:", e);
+        }
+    };
+
     return (
-        <div 
-            ref={chartContainerRef} 
-            style={{ 
-                position: 'relative', 
-                width: '100%', 
-                height: '500px'  // 强制高度，防止高度塌陷
-            }} 
+        <div
+            ref={chartContainerRef}
+            style={{
+                position: 'relative',
+                width: '100%',
+                height: '500px'
+            }}
         />
     );
 };
