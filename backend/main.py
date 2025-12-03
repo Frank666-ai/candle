@@ -115,6 +115,17 @@ async def get_exchange(exchange_id: str, market_type: str = 'spot'):
 async def get_public_exchange(exchange_id: str, market_type: str = 'spot'):
     return await get_exchange_instance(exchange_id, market_type, use_auth=False)
 
+def get_binance_futures_client():
+    """获取币安合约官方SDK客户端（用于开仓交易）- 复用现有client"""
+    try:
+        client = get_binance_official_client()
+        if not client:
+            raise ValueError("币安官方SDK客户端初始化失败")
+        return client
+    except Exception as e:
+        print(f"[币安官方SDK] ✗ 获取客户端失败: {e}")
+        raise e
+
 def get_binance_official_client():
     """获取币安官方SDK客户端（用于余额查询）"""
     global binance_official_client
@@ -248,9 +259,21 @@ def check_pinbar(ohlcv, direction='long', body_ratio=0.66):
     return False
 
 async def strategy_check(exchange, symbol, main_tf, strategy_config):
+    """
+    Pinbar多周期共振策略
+    返回: (signal, signal_candle, analysis_detail)
+    """
     timeframes = ['1h', '4h', '1d']
     signals = {'long': 0, 'short': 0}
     signal_candle = None
+    
+    # 详细分析数据
+    analysis = {
+        'timeframes_checked': [],
+        'confluence_found': {},
+        'ratios': {},
+        'prices': {}
+    }
     
     try:
         # 获取更多K线以确保包含上一根已收盘K线
@@ -261,29 +284,66 @@ async def strategy_check(exchange, symbol, main_tf, strategy_config):
             if isinstance(res, Exception) or len(res) < 2:
                 continue
             
+            tf = timeframes[i]
             # 使用倒数第二根K线（res[-2]），即上一根已收盘确认的K线
-            candle = res[-2] 
+            candle = res[-2]
+            time_ms, open_p, high, low, close, volume = candle
             
+            # 计算K线形态参数
+            body = abs(close - open_p)
+            upper_wick = high - max(open_p, close)
+            lower_wick = min(open_p, close) - low
+            
+            analysis['timeframes_checked'].append(tf)
+            analysis['prices'][tf] = {
+                'open': open_p,
+                'high': high,
+                'low': low,
+                'close': close,
+                'time': datetime.datetime.fromtimestamp(time_ms/1000).strftime('%Y-%m-%d %H:%M')
+            }
+            
+            # 检查做多信号（下影线长 = Pinbar）
             if check_pinbar(candle, 'long', strategy_config['ratio']):
                 signals['long'] += 1
-                if timeframes[i] == main_tf:
+                ratio = lower_wick / body if body > 0 else 0
+                analysis['ratios'][tf] = {
+                    'type': 'Pinbar做多',
+                    'lower_wick': lower_wick,
+                    'body': body,
+                    'ratio': round(ratio, 2)
+                }
+                if tf == main_tf:
                     signal_candle = candle
+                    analysis['confluence_found']['long'] = analysis['confluence_found'].get('long', []) + [tf]
+            
+            # 检查做空信号（上影线长 = Shooting Star）
             if check_pinbar(candle, 'short', strategy_config['ratio']):
                 signals['short'] += 1
-                if timeframes[i] == main_tf:
+                ratio = upper_wick / body if body > 0 else 0
+                analysis['ratios'][tf] = {
+                    'type': 'Shooting Star做空',
+                    'upper_wick': upper_wick,
+                    'body': body,
+                    'ratio': round(ratio, 2)
+                }
+                if tf == main_tf:
                     signal_candle = candle
+                    analysis['confluence_found']['short'] = analysis['confluence_found'].get('short', []) + [tf]
         
         required_confluence = strategy_config.get('confluence', 2)
+        analysis['required_confluence'] = required_confluence
+        analysis['signals_count'] = signals
         
         if signals['long'] >= required_confluence:
-            return 'buy', signal_candle
+            return 'buy', signal_candle, analysis
         if signals['short'] >= required_confluence:
-            return 'sell', signal_candle
+            return 'sell', signal_candle, analysis
             
     except Exception as e:
         print(f"Strategy Engine Error: {e}")
     
-    return None, None
+    return None, None, None
 
 # ==========================================
 # 策略管理器 (Global Strategy Manager)
@@ -300,13 +360,17 @@ class StrategyManager:
     def _save_strategies(self):
         """保存策略到文件"""
         try:
-            # 只保存配置和必要的状态，不保存运行时数据
+            # 保存配置和状态（包含 last_processed_time 防止重复交易）
             save_data = {}
             for sid, sdata in self.strategies.items():
                 save_data[sid] = {
                     "config": sdata["config"],
                     "start_time": sdata.get("start_time"),
-                    "status": sdata.get("status", "running")
+                    "status": sdata.get("status", "running"),
+                    "last_processed_time": sdata.get("last_processed_time", 0),  # ✅ 保存时间戳
+                    "last_signal": sdata.get("last_signal"),  # 保存最后信号
+                    "trade_history": sdata.get("trade_history", []),  # ✅ 保存交易历史
+                    "current_position": sdata.get("current_position")  # ✅ 保存当前持仓
                 }
             
             with open(self.STRATEGIES_FILE, 'w', encoding='utf-8') as f:
@@ -332,7 +396,10 @@ class StrategyManager:
                     "config": sdata["config"],
                     "status": "loaded",  # 标记为已加载但未运行
                     "start_time": sdata.get("start_time"),
-                    "last_processed_time": 0,
+                    "last_processed_time": sdata.get("last_processed_time", 0),  # ✅ 恢复时间戳
+                    "last_signal": sdata.get("last_signal"),  # 恢复最后信号
+                    "trade_history": sdata.get("trade_history", []),  # ✅ 恢复交易历史
+                    "current_position": sdata.get("current_position"),  # ✅ 恢复当前持仓
                     "logs": []
                 }
             
@@ -365,7 +432,9 @@ class StrategyManager:
                 "config": v["config"],
                 "status": v["status"],
                 "last_signal": v.get("last_signal"),
-                "start_time": v.get("start_time")
+                "start_time": v.get("start_time"),
+                "trade_history": v.get("trade_history", []),  # ✅ 返回交易历史
+                "current_position": v.get("current_position")  # ✅ 返回当前持仓
             }
             for k, v in self.strategies.items()
         ]
@@ -460,15 +529,39 @@ class StrategyManager:
                 return
             
             # 币安：查询持仓模式（策略初始化时查询一次）
-            is_hedge_mode = False  # 默认为单向持仓模式（更安全，兼容性更好）
+            is_hedge_mode = False  # 默认为单向持仓模式
             if exchange_id == 'binance' and market_type == 'future':
                 try:
-                    position_mode_response = await exchange.fapiPrivate_get_positionside_dual()
+                    # ccxt 正确的调用方法（使用 fapiPrivateGetPositionsideDual）
+                    position_mode_response = await exchange.fapiPrivateGetPositionsideDual()
                     is_hedge_mode = position_mode_response.get('dualSidePosition', False)
-                    print(f"[策略-持仓模式] API返回: {position_mode_response}, 双向持仓: {is_hedge_mode}")
+                    
+                    mode_str = "双向持仓模式（Hedge Mode）" if is_hedge_mode else "单向持仓模式（One-Way Mode）"
+                    print(f"[策略-持仓模式] ✓ 检测成功: {mode_str}")
+                    print(f"[策略-持仓模式] API返回: {position_mode_response}")
                 except Exception as mode_err:
-                    print(f"[策略-持仓模式] 查询失败，默认为单向模式: {mode_err}")
-                    is_hedge_mode = False  # 修复：查询失败时默认为单向模式，避免误加 positionSide 参数
+                    # 查询失败时，通过实际测试来判断模式
+                    print(f"[策略-持仓模式] ⚠ 查询方法失败: {mode_err}")
+                    print(f"[策略-持仓模式] 尝试通过获取持仓来推断模式...")
+                    
+                    try:
+                        # 获取所有持仓
+                        test_positions = await exchange.fetch_positions()
+                        # 检查是否有 positionSide 字段为 LONG/SHORT
+                        for pos in test_positions:
+                            pos_side = pos.get('info', {}).get('positionSide', '')
+                            if pos_side in ['LONG', 'SHORT']:
+                                is_hedge_mode = True
+                                print(f"[策略-持仓模式] ✓ 推断为双向模式（检测到positionSide={pos_side}）")
+                                break
+                        
+                        if not is_hedge_mode:
+                            print(f"[策略-持仓模式] ✓ 推断为单向模式（未检测到LONG/SHORT标记）")
+                    except:
+                        print(f"[策略-持仓模式] ⚠ 推断失败，保持默认单向模式")
+                    
+                    mode_str = "双向持仓模式（Hedge Mode）" if is_hedge_mode else "单向持仓模式（One-Way Mode）"
+                    print(f"[策略-持仓模式] 最终结果: {mode_str}")
                 
             await broadcast_message({
                 "type": "strategy_log", 
@@ -484,20 +577,35 @@ class StrategyManager:
                         break
                         
                     # 1. 检查信号
-                    signal, signal_candle = await strategy_check(exchange, symbol, timeframe, strategy_config_params)
+                    signal, signal_candle, analysis_detail = await strategy_check(exchange, symbol, timeframe, strategy_config_params)
                     
                     if signal and signal_candle:
-                         # K线时间戳检查
+                         # K线时间戳检查（防止重复处理同一根K线）
                         last_time = strategy_data.get('last_processed_time', 0)
                         if signal_candle[0] <= last_time:
                             await asyncio.sleep(5)
                             continue
                         
-                        # 标记该K线信号已处理
-                        strategy_data['last_processed_time'] = signal_candle[0]
-                        strategy_data['last_signal'] = f"{signal.upper()} @ {datetime.datetime.fromtimestamp(signal_candle[0]/1000)}"
+                        print(f"[策略信号] 检测到信号: {signal.upper()} {symbol} @ K线时间: {datetime.datetime.fromtimestamp(signal_candle[0]/1000)}")
                         
-                        # 2. 持仓检查（参考NOFX：检查同币种同方向持仓）
+                        # 2. 持仓检查（多层防护，防止重复开仓/加仓）
+                        # ============================================
+                        # 第一层：检查本地状态（最快，最准确）
+                        # ============================================
+                        if strategy_data.get('current_position'):
+                            local_pos = strategy_data['current_position']
+                            target_side = 'buy' if signal == 'buy' else 'sell'
+                            
+                            # 检查是否已有持仓
+                            if local_pos.get('symbol') == symbol:
+                                msg = f"⛔ 本地检测到持仓，拒绝开仓 (方向: {local_pos.get('side')}, 入场价: {local_pos.get('entry_price')})"
+                                print(f"[策略-持仓检查] {msg}")
+                                await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": msg, "level": "warning"})
+                                continue
+                        
+                        # ============================================
+                        # 第二层：查询交易所实际持仓（双重保险）
+                        # ============================================
                         has_position = False
                         has_same_direction_position = False
                         if market_type == 'future':
@@ -507,9 +615,9 @@ class StrategyManager:
                                 
                                 for pos in positions:
                                     amt = float(pos.get('contracts', 0) or pos.get('info', {}).get('positionAmt', 0))
-                                    if pos['symbol'] == symbol and abs(amt) > 0:
+                                    if pos['symbol'] == symbol and abs(amt) > 0.00001:  # 使用小阈值，更敏感
                                         has_position = True
-                                        # 检查是否同方向（NOFX的防重复逻辑）
+                                        # 检查是否同方向
                                         pos_side_raw = pos.get('info', {}).get('positionSide', '')
                                         if pos_side_raw in ['LONG', 'SHORT']:
                                             pos_side = pos_side_raw.lower()
@@ -518,20 +626,28 @@ class StrategyManager:
                                         
                                         if pos_side == target_side:
                                             has_same_direction_position = True
-                                            break
+                                        
+                                        print(f"[策略-持仓检查] 交易所检测到持仓: {symbol} {pos_side} {abs(amt)}")
+                                        break
                             except Exception as e:
-                                print(f"Pos check error: {e}")
+                                print(f"[策略-持仓检查] ⚠ 查询失败: {e}")
                         
                         if has_same_direction_position:
-                            msg = f"信号忽略: {symbol} 已有{target_side}仓，拒绝重复开仓"
+                            msg = f"⛔ 交易所检测到同方向持仓 ({target_side})，拒绝加仓"
                             await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": msg, "level": "warning"})
-                            print(f"[策略] {msg}")
+                            print(f"[策略-持仓检查] {msg}")
                             continue
                         
                         if has_position:
-                            msg = f"信号忽略: {symbol} 已有持仓（方向不同）"
+                            msg = f"⛔ 交易所检测到反向持仓，拒绝开仓（避免锁仓）"
                             await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": msg, "level": "warning"})
+                            print(f"[策略-持仓检查] {msg}")
                             continue
+                        
+                        # ============================================
+                        # ✅ 所有检查通过，允许开仓
+                        # ============================================
+                        print(f"[策略-持仓检查] ✓ 无持仓，允许开仓")
 
                         # 3. 执行交易
                         # 获取现价
@@ -563,8 +679,7 @@ class StrategyManager:
                                 tp_price = current_price - (risk * strategy_config_params['tp'])
                                 sl_price = current_price + (risk * strategy_config_params['sl'])
                         
-                        log_msg = f"触发交易: {signal.upper()} {symbol} @ {current_price}"
-                        await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": log_msg, "level": "success"})
+                        print(f"[策略信号] 触发交易: {signal.upper()} {symbol} @ {current_price}")
 
                         # 下单逻辑
                         try:
@@ -586,6 +701,29 @@ class StrategyManager:
 
                             # 计算数量
                             usdt_amount = strategy_config_params['amount']
+                            leverage = strategy_config_params['leverage']
+                            
+                            # ============================================
+                            # 💡 金额计算模式选择
+                            # ============================================
+                            # 模式1（当前）：usdt_amount = 名义价值（订单总价值）
+                            #   - 10 USDT = 持仓价值10 USDT，占用保证金 10/5 = 2 USDT
+                            #   - 风险低，适合新手
+                            
+                            # 模式2（可选）：usdt_amount = 保证金金额
+                            #   - 10 USDT = 保证金10 USDT，持仓价值 10×5 = 50 USDT
+                            #   - 风险高，充分利用杠杆
+                            
+                            use_margin_mode = True  # ← 保证金模式已启用 💪
+                            
+                            if use_margin_mode:
+                                # 保证金模式：放大到杠杆后的总价值
+                                margin_amount = strategy_config_params['amount']  # 保存原始保证金金额
+                                usdt_amount = usdt_amount * leverage
+                                print(f"[策略开仓] 💪 保证金模式：保证金 {margin_amount} USDT × {leverage}x = 名义价值 {usdt_amount} USDT")
+                            else:
+                                # 名义价值模式：直接使用设置的金额
+                                print(f"[策略开仓] 📊 名义价值模式：订单总价值 {usdt_amount} USDT，占用保证金 {usdt_amount/leverage:.2f} USDT")
                             
                             # 币安最小订单金额检查
                             if exchange_id == 'binance' and market_type == 'future':
@@ -598,58 +736,165 @@ class StrategyManager:
                             
                             coin_amount = usdt_amount / current_price
                             
-                            # 精度处理... (简化版，详细逻辑复用之前代码)
-                            coin_amount = round(coin_amount, 5) 
-
-                            # 市价单开仓
-                            open_params = {}
-                            # 币安合约：总是指定 positionSide（参考NOFX实现）
-                            # 单向模式下币安会自动忽略此参数，双向模式下必须指定
-                            if exchange_id == 'binance' and market_type == 'future':
-                                position_side = 'LONG' if signal == 'buy' else 'SHORT'
-                                open_params['positionSide'] = position_side
-                                print(f"[策略开仓] {signal.upper()} positionSide={position_side}")
-                            
-                            # 执行开仓（参考NOFX）
+                            # ============================================
+                            # 使用币安官方SDK开仓（参考NOFX，确保API调用准确）
+                            # ============================================
                             print(f"[策略开仓] {'📈 开多仓' if signal == 'buy' else '📉 开空仓'}: {symbol}")
-                            print(f"[策略开仓] 数量: {coin_amount:.4f} | 价格: {current_price:.4f} | 总值: {usdt_amount:.2f} USDT")
+                            print(f"[策略开仓] 原始计算: {coin_amount} | 价格: {current_price:.4f} | 目标金额: {usdt_amount:.2f} USDT")
                             
-                            order = await exchange.create_market_order(symbol, signal, coin_amount, open_params)
-                            
-                            print(f"[策略开仓] ✓ 开仓成功，订单ID: {order['id']}")
-                            await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": f"✓ {signal.upper()} {symbol} 成功，订单: {order['id']}", "level": "success"})
-                            
-                            # 止盈止损（合约）
-                            if market_type == 'future':
-                                exit_side = 'sell' if signal == 'buy' else 'buy'
-                                position_side = 'LONG' if signal == 'buy' else 'SHORT'
-                                
-                                # 止盈止损参数
-                                sl_params = {'stopPrice': sl_price, 'closePosition': True}
-                                tp_params = {'stopPrice': tp_price, 'closePosition': True}
-                                
-                                # 币安合约：总是指定 positionSide
-                                if exchange_id == 'binance':
-                                    sl_params['positionSide'] = position_side
-                                    tp_params['positionSide'] = position_side
-                                    print(f"[策略止盈止损] positionSide={position_side}")
-                                
-                                # SL
+                            if exchange_id == 'binance' and market_type == 'future':
+                                # 币安合约最小数量要求（查询市场信息）
                                 try:
-                                    await exchange.create_order(symbol, 'STOP_MARKET', exit_side, coin_amount, sl_params)
-                                    print(f"[策略止损] ✓ 止损价设置: {sl_price:.4f}")
+                                    market = exchange.market(symbol)
+                                    min_amount = market['limits']['amount']['min']
+                                    if min_amount and coin_amount < min_amount:
+                                        min_usdt_needed = min_amount * current_price
+                                        msg = f"❌ {symbol} 最小交易量: {min_amount}，需要至少 {min_usdt_needed:.2f} USDT，当前仅 {usdt_amount} USDT"
+                                        print(f"[策略开仓] {msg}")
+                                        await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": msg, "level": "error"})
+                                        continue
+                                except Exception as check_err:
+                                    print(f"[策略开仓] ⚠ 无法查询最小数量限制: {check_err}")
+                                
+                                # 使用 ccxt 的精度处理（获取交易所规则）
+                                coin_amount_precision = float(exchange.amount_to_precision(symbol, coin_amount))
+                                actual_value = coin_amount_precision * current_price
+                                
+                                print(f"[策略开仓] 精度处理后数量: {coin_amount_precision}")
+                                print(f"[策略开仓] 实际下单价值: {actual_value:.2f} USDT")
+                                
+                                # 如果精度处理后金额偏差过大（>20%），警告用户
+                                if abs(actual_value - usdt_amount) / usdt_amount > 0.2:
+                                    msg = f"⚠ 精度限制：目标 {usdt_amount} USDT → 实际 {actual_value:.2f} USDT (偏差 {abs(actual_value - usdt_amount):.2f})"
+                                    print(f"[策略开仓] {msg}")
+                                    await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": msg, "level": "warning"})
+                                
+                                coin_amount = coin_amount_precision
+                                # 使用币安官方SDK开仓
+                                from binance.client import Client
+                                binance_client = get_binance_futures_client()
+                                
+                                # 格式化交易对（去掉斜杠）
+                                binance_symbol = symbol.replace('/', '')
+                                
+                                # 直接转字符串（ccxt已处理好精度）
+                                quantity_str = str(coin_amount)
+                                
+                                print(f"[策略开仓] 最终数量: {quantity_str} {binance_symbol}")
+                                
+                                # 执行开仓（参考NOFX binance_futures.go）
+                                try:
+                                    if signal == 'buy':
+                                        # 开多仓
+                                        order = binance_client.futures_create_order(
+                                            symbol=binance_symbol,
+                                            side='BUY',
+                                            positionSide='LONG',  # 总是指定（参考NOFX）
+                                            type='MARKET',
+                                            quantity=quantity_str
+                                        )
+                                        print(f"[策略开仓-官方SDK] ✓ 开多仓成功，订单ID: {order['orderId']}")
+                                    else:
+                                        # 开空仓
+                                        order = binance_client.futures_create_order(
+                                            symbol=binance_symbol,
+                                            side='SELL',
+                                            positionSide='SHORT',  # 总是指定（参考NOFX）
+                                            type='MARKET',
+                                            quantity=quantity_str
+                                        )
+                                        print(f"[策略开仓-官方SDK] ✓ 开空仓成功，订单ID: {order['orderId']}")
+                                    
+                                    await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": f"✓ {signal.upper()} {symbol} 成功，订单: {order['orderId']}", "level": "success"})
+                                except BinanceAPIException as api_err:
+                                    error_msg = f"币安API错误 {api_err.code}: {api_err.message}"
+                                    print(f"[策略开仓-官方SDK] ❌ {error_msg}")
+                                    raise Exception(error_msg)
+                            else:
+                                # 其他交易所使用ccxt
+                                open_params = {}
+                                order = await exchange.create_market_order(symbol, signal, coin_amount, open_params)
+                                print(f"[策略开仓] ✓ 开仓成功，订单ID: {order['id']}")
+                                await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": f"✓ {signal.upper()} {symbol} 成功，订单: {order['id']}", "level": "success"})
+                            
+                            # ✅ 开仓成功后才标记该K线已处理（防止重复开仓）
+                            strategy_data['last_processed_time'] = signal_candle[0]
+                            strategy_data['last_signal'] = f"{signal.upper()} @ {datetime.datetime.fromtimestamp(signal_candle[0]/1000)}"
+                            
+                            # ✅ 保存详细的交易决策信息
+                            trade_decision = {
+                                'signal_time': datetime.datetime.fromtimestamp(signal_candle[0]/1000).strftime('%Y-%m-%d %H:%M:%S'),
+                                'signal_type': signal.upper(),
+                                'entry_price': current_price,
+                                'entry_time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'quantity': coin_amount,
+                                'usdt_value': actual_value if 'actual_value' in locals() else usdt_amount,
+                                'leverage': strategy_config_params['leverage'],
+                                'tp_price': tp_price,
+                                'sl_price': sl_price,
+                                'order_id': order.get('orderId') if exchange_id == 'binance' else order.get('id'),
+                                'analysis': analysis_detail,  # 详细的信号分析
+                                'status': 'open'  # open/closed
+                            }
+                            
+                            # 保存到策略数据（保留最近10条）
+                            if 'trade_history' not in strategy_data:
+                                strategy_data['trade_history'] = []
+                            strategy_data['trade_history'].insert(0, trade_decision)
+                            strategy_data['trade_history'] = strategy_data['trade_history'][:10]  # 只保留最近10条
+                            
+                            # 当前持仓信息
+                            strategy_data['current_position'] = {
+                                'symbol': symbol,
+                                'side': signal,
+                                'entry_price': current_price,
+                                'entry_time': trade_decision['entry_time'],
+                                'quantity': coin_amount,
+                                'tp_price': tp_price,
+                                'sl_price': sl_price
+                            }
+                            
+                            print(f"[策略] ✓ K线时间戳已标记: {signal_candle[0]}")
+                            
+                            # ✅ 立即保存到文件（防止重启后重复交易）
+                            self._save_strategies()
+                            
+                            # 止盈止损（合约）- 使用币安官方SDK
+                            if market_type == 'future' and exchange_id == 'binance':
+                                position_side_str = 'LONG' if signal == 'buy' else 'SHORT'
+                                exit_side_str = 'SELL' if signal == 'buy' else 'BUY'
+                                binance_symbol = symbol.replace('/', '')
+                                
+                                # 止损单（STOP_MARKET）- closePosition=true 会自动平掉整个仓位，无需指定数量
+                                try:
+                                    sl_order = binance_client.futures_create_order(
+                                        symbol=binance_symbol,
+                                        side=exit_side_str,
+                                        positionSide=position_side_str,
+                                        type='STOP_MARKET',
+                                        stopPrice=f"{sl_price:.2f}",
+                                        closePosition='true'
+                                    )
+                                    print(f"[策略止损-官方SDK] ✓ 止损价设置: {sl_price:.2f}")
                                 except Exception as sl_err:
-                                    print(f"[策略止损] ⚠ 设置止损失败: {sl_err}")
-                                    await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": f"⚠ 止损设置失败: {sl_err}", "level": "warning"})
+                                    print(f"[策略止损-官方SDK] ⚠ 设置止损失败: {sl_err}")
+                                    await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": f"⚠ 止损设置失败", "level": "warning"})
                                 
-                                # TP
+                                # 止盈单（TAKE_PROFIT_MARKET）
                                 try:
-                                    await exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', exit_side, coin_amount, tp_params)
-                                    print(f"[策略止盈] ✓ 止盈价设置: {tp_price:.4f}")
+                                    tp_order = binance_client.futures_create_order(
+                                        symbol=binance_symbol,
+                                        side=exit_side_str,
+                                        positionSide=position_side_str,
+                                        type='TAKE_PROFIT_MARKET',
+                                        stopPrice=f"{tp_price:.2f}",
+                                        closePosition='true'
+                                    )
+                                    print(f"[策略止盈-官方SDK] ✓ 止盈价设置: {tp_price:.2f}")
                                     await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": "✓ 止盈止损已设置", "level": "success"})
                                 except Exception as tp_err:
-                                    print(f"[策略止盈] ⚠ 设置止盈失败: {tp_err}")
-                                    await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": f"⚠ 止盈设置失败: {tp_err}", "level": "warning"})
+                                    print(f"[策略止盈-官方SDK] ⚠ 设置止盈失败: {tp_err}")
+                                    await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": f"⚠ 止盈设置失败", "level": "warning"})
 
                         except Exception as trade_err:
                             error_msg = f"交易失败: {str(trade_err)}"
@@ -657,6 +902,143 @@ class StrategyManager:
                             traceback.print_exc()
                             await broadcast_message({"type": "strategy_log", "id": strategy_id, "msg": f"❌ {error_msg}", "level": "error"})
 
+                    # ============================================
+                    # 持仓状态同步（检查是否已平仓）
+                    # ============================================
+                    if market_type == 'future' and strategy_data.get('current_position'):
+                        # 检查本地记录的持仓是否还存在
+                        local_position = strategy_data['current_position']
+                        position_still_exists = False
+                        
+                        try:
+                            positions = await exchange.fetch_positions()
+                            for pos in positions:
+                                amt = float(pos.get('contracts', 0) or pos.get('info', {}).get('positionAmt', 0))
+                                if pos['symbol'] == local_position['symbol'] and abs(amt) > 0.00001:
+                                    position_still_exists = True
+                                    break
+                        except Exception as e:
+                            print(f"[持仓同步] 查询失败: {e}")
+                        
+                        # 如果持仓已不存在（止损/止盈触发），清除本地记录
+                        if not position_still_exists:
+                            close_reason = "止损/止盈触发"
+                            close_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            print(f"[持仓同步] ✓ 检测到持仓已平仓: {local_position['symbol']} ({close_reason})")
+                            
+                            # 更新交易历史
+                            if strategy_data.get('trade_history') and len(strategy_data['trade_history']) > 0:
+                                latest_trade = strategy_data['trade_history'][0]
+                                if latest_trade.get('status') == 'open':
+                                    latest_trade['status'] = 'closed'
+                                    latest_trade['close_time'] = close_time
+                                    latest_trade['close_reason'] = close_reason
+                            
+                            # 清除当前持仓
+                            strategy_data['current_position'] = None
+                            self._save_strategies()
+                            
+                            # 通知用户
+                            await broadcast_message({
+                                "type": "strategy_log",
+                                "id": strategy_id,
+                                "msg": f"✓ {local_position['symbol']} 已平仓 ({close_reason})",
+                                "level": "success"
+                            })
+                            
+                            continue  # 跳过移动止损逻辑
+                    
+                    # ============================================
+                    # 移动止损逻辑（针对已有持仓）
+                    # ============================================
+                    if market_type == 'future' and strategy_data.get('current_position'):
+                        try:
+                            current_pos = strategy_data['current_position']
+                            
+                            # 获取4H K线（用于移动止损）
+                            klines_4h = await exchange.fetch_ohlcv(symbol, '4h', limit=3)
+                            if klines_4h and len(klines_4h) >= 2:
+                                # 使用倒数第二根K线（已收盘确认）
+                                prev_4h_candle = klines_4h[-2]
+                                time_ms, open_p, high, low, close, volume = prev_4h_candle
+                                
+                                current_sl = current_pos.get('sl_price', 0)
+                                new_sl = None
+                                should_update = False
+                                
+                                if current_pos['side'] == 'buy':
+                                    # 做多：移动止损到4H K线最低点
+                                    new_sl = low
+                                    # 只有新止损更高时才移动（向上移动止损，保护利润）
+                                    if new_sl > current_sl:
+                                        should_update = True
+                                        reason = f"多单止损上移: {current_sl:.2f} → {new_sl:.2f} (4H低点)"
+                                else:  # short
+                                    # 做空：移动止损到4H K线最高点
+                                    new_sl = high
+                                    # 只有新止损更低时才移动（向下移动止损，保护利润）
+                                    if new_sl < current_sl:
+                                        should_update = True
+                                        reason = f"空单止损下移: {current_sl:.2f} → {new_sl:.2f} (4H高点)"
+                                
+                                if should_update:
+                                    print(f"[移动止损] {reason}")
+                                    
+                                    # 1. 取消所有旧的委托单（止盈止损）
+                                    try:
+                                        await exchange.cancel_all_orders(symbol)
+                                        print(f"[移动止损] 已取消 {symbol} 的所有旧委托单")
+                                    except Exception as cancel_err:
+                                        print(f"[移动止损] 取消委托失败: {cancel_err}")
+                                    
+                                    # 2. 设置新的移动止损（取消止盈，只保留止损）
+                                    if exchange_id == 'binance':
+                                        binance_client = get_binance_futures_client()
+                                        binance_symbol = symbol.replace('/', '')
+                                        
+                                        position_side_str = 'LONG' if current_pos['side'] == 'buy' else 'SHORT'
+                                        exit_side_str = 'SELL' if current_pos['side'] == 'buy' else 'BUY'
+                                        
+                                        try:
+                                            sl_order = binance_client.futures_create_order(
+                                                symbol=binance_symbol,
+                                                side=exit_side_str,
+                                                positionSide=position_side_str,
+                                                type='STOP_MARKET',
+                                                stopPrice=f"{new_sl:.2f}",
+                                                closePosition='true'
+                                            )
+                                            print(f"[移动止损] ✓ 新止损已设置: {new_sl:.2f}")
+                                            
+                                            # 更新策略数据
+                                            current_pos['sl_price'] = new_sl
+                                            current_pos['trailing_stop_history'] = current_pos.get('trailing_stop_history', [])
+                                            current_pos['trailing_stop_history'].append({
+                                                'time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                                'old_sl': current_sl,
+                                                'new_sl': new_sl,
+                                                'candle_time': datetime.datetime.fromtimestamp(time_ms/1000).strftime('%Y-%m-%d %H:%M'),
+                                                'candle_low': low if current_pos['side'] == 'buy' else None,
+                                                'candle_high': high if current_pos['side'] == 'short' else None
+                                            })
+                                            
+                                            # 保存到文件
+                                            self._save_strategies()
+                                            
+                                            # 发送通知
+                                            await broadcast_message({
+                                                "type": "strategy_log",
+                                                "id": strategy_id,
+                                                "msg": f"✓ {reason}",
+                                                "level": "success"
+                                            })
+                                        except Exception as sl_err:
+                                            print(f"[移动止损] ✗ 设置失败: {sl_err}")
+                        except Exception as trailing_err:
+                            # 移动止损失败不影响策略运行
+                            pass
+                    
                     await asyncio.sleep(10) # 10秒检查一次
                 except Exception as loop_err:
                     print(f"Strategy Loop Error ({symbol}): {loop_err}")
@@ -1021,15 +1403,29 @@ async def close_position(data: dict = Body(...)):
             return {"success": False, "error": "Exchange not ready or API Key missing"}
         
         # 1. 先判断持仓模式 (Hedge Mode)
-        is_hedge_mode = False  # 默认为单向持仓模式（更安全，避免误加 positionSide）
+        is_hedge_mode = False  # 默认为单向持仓模式
         if exchange_id == 'binance':
             try:
-                position_mode_response = await exchange.fapiPrivate_get_positionside_dual()
+                # 尝试正确的 ccxt 方法名
+                position_mode_response = await exchange.fapiPrivateGetPositionsideDual()
                 is_hedge_mode = position_mode_response.get('dualSidePosition', False)
-                print(f"[持仓模式] 双向持仓: {is_hedge_mode}")
+                print(f"[持仓模式] ✓ 双向持仓: {is_hedge_mode}")
             except Exception as mode_err:
-                print(f"[持仓模式] 查询失败，默认为单向: {mode_err}")
-                is_hedge_mode = False
+                # 查询失败，通过持仓推断
+                print(f"[持仓模式] 查询失败，尝试推断...")
+                try:
+                    test_positions = await exchange.fetch_positions()
+                    for pos in test_positions:
+                        pos_side = pos.get('info', {}).get('positionSide', '')
+                        if pos_side in ['LONG', 'SHORT']:
+                            is_hedge_mode = True
+                            print(f"[持仓模式] ✓ 推断为双向模式")
+                            break
+                    if not is_hedge_mode:
+                        print(f"[持仓模式] ✓ 推断为单向模式")
+                except:
+                    print(f"[持仓模式] ⚠ 推断失败，使用默认单向模式")
+                    is_hedge_mode = False
         
         # 2. 获取该币种的实际持仓
         # 注意：fetch_positions([symbol]) 可能返回多个持仓（多和空）
@@ -1143,6 +1539,22 @@ async def close_position(data: dict = Body(...)):
         
         print(f"[平仓成功] 订单ID: {order['id']}")
         
+        # ✅ 清除相关策略的 current_position（防止重复检查导致无法开新仓）
+        for sid, sdata in strategy_manager.strategies.items():
+            if sdata.get('current_position') and sdata['current_position'].get('symbol') == symbol:
+                print(f"[平仓-策略同步] 清除策略 {sid} 的持仓记录")
+                sdata['current_position'] = None
+                
+                # 更新交易历史状态
+                if sdata.get('trade_history') and len(sdata['trade_history']) > 0:
+                    latest_trade = sdata['trade_history'][0]
+                    if latest_trade.get('status') == 'open':
+                        latest_trade['status'] = 'closed'
+                        latest_trade['close_time'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        latest_trade['close_reason'] = '手动平仓'
+                
+                strategy_manager._save_strategies()
+        
         return {
             "success": True,
             "orderId": order['id'],
@@ -1169,15 +1581,29 @@ async def close_all_positions(data: dict = Body(...)):
             return {"success": False, "error": "Exchange not ready or API Key missing"}
         
         # 币安：查询用户的持仓模式
-        is_hedge_mode = False  # 默认为单向持仓模式（更安全，避免误加 positionSide）
+        is_hedge_mode = False  # 默认为单向持仓模式
         if exchange_id == 'binance':
             try:
-                position_mode_response = await exchange.fapiPrivate_get_positionside_dual()
+                # 尝试正确的 ccxt 方法名
+                position_mode_response = await exchange.fapiPrivateGetPositionsideDual()
                 is_hedge_mode = position_mode_response.get('dualSidePosition', False)
-                print(f"[持仓模式-全部] API返回: {position_mode_response}, 双向持仓: {is_hedge_mode}")
+                print(f"[持仓模式-全部] ✓ 双向持仓: {is_hedge_mode}")
             except Exception as mode_err:
-                print(f"[持仓模式-全部] 查询失败，默认为单向模式: {mode_err}")
-                is_hedge_mode = False  # 修复：查询失败时默认为单向模式
+                # 查询失败，通过持仓推断
+                print(f"[持仓模式-全部] 查询失败，尝试推断...")
+                try:
+                    test_positions = await exchange.fetch_positions()
+                    for pos in test_positions:
+                        pos_side = pos.get('info', {}).get('positionSide', '')
+                        if pos_side in ['LONG', 'SHORT']:
+                            is_hedge_mode = True
+                            print(f"[持仓模式-全部] ✓ 推断为双向模式")
+                            break
+                    if not is_hedge_mode:
+                        print(f"[持仓模式-全部] ✓ 推断为单向模式")
+                except:
+                    print(f"[持仓模式-全部] ⚠ 推断失败，使用默认单向模式")
+                    is_hedge_mode = False
         
         # 获取所有持仓
         positions = await exchange.fetch_positions()
@@ -1191,22 +1617,15 @@ async def close_all_positions(data: dict = Body(...)):
 
             symbol = pos['symbol']
             
-            # 2. 判定持仓方向 (双向模式依赖 positionSide, 单向模式依赖 amt 正负)
+            # 2. 判定持仓方向
             side = None
-            
-            if is_hedge_mode:
-                # 双向模式：直接读取 positionSide
-                pos_side = pos.get('info', {}).get('positionSide')
-                if pos_side in ['LONG', 'SHORT']:
-                    side = pos_side.lower()
-            
-            if not side:
-                # 单向模式或回退逻辑：根据数量正负判断
+            pos_side = pos.get('info', {}).get('positionSide')
+            if pos_side in ['LONG', 'SHORT']:
+                side = pos_side.lower()
+            else:
                 side = 'long' if raw_amt > 0 else 'short'
             
             # 3. 决定平仓的买卖方向
-            # 平多(long) -> 卖出(sell)
-            # 平空(short) -> 买入(buy)
             close_side = 'sell' if side == 'long' else 'buy'
             
             try:
@@ -1215,18 +1634,15 @@ async def close_all_positions(data: dict = Body(...)):
                 # 市价单平仓参数
                 params = {'reduceOnly': True}
                 
-                # 4. 币安双向持仓模式：必须指定 positionSide
-                if exchange_id == 'binance' and is_hedge_mode:
-                    # 关键修正：平仓时，positionSide 必须与持仓方向一致
-                    # 平多 -> 操作 LONG 仓位 -> positionSide='LONG'
-                    # 平空 -> 操作 SHORT 仓位 -> positionSide='SHORT'
+                # 4. 币安合约：总是指定 positionSide
+                if exchange_id == 'binance':
                     params['positionSide'] = 'LONG' if side == 'long' else 'SHORT'
                     print(f"[平仓参数] {symbol}: positionSide={params['positionSide']}")
                 
                 order = await exchange.create_market_order(
                     symbol,
                     close_side,
-                    abs(raw_amt), # 下单数量始终为正数
+                    abs(raw_amt),
                     params
                 )
                 closed_positions.append({
@@ -1239,6 +1655,24 @@ async def close_all_positions(data: dict = Body(...)):
                 print(f"[平仓失败] {symbol}: {e}")
         
         print(f"[全部平仓完成] 成功: {len(closed_positions)}, 失败: {len(errors)}")
+        
+        # ✅ 清除所有相关策略的 current_position
+        closed_symbols = set(pos['symbol'] for pos in closed_positions)
+        for sid, sdata in strategy_manager.strategies.items():
+            if sdata.get('current_position') and sdata['current_position'].get('symbol') in closed_symbols:
+                print(f"[全部平仓-策略同步] 清除策略 {sid} 的持仓记录")
+                sdata['current_position'] = None
+                
+                # 更新交易历史状态
+                if sdata.get('trade_history') and len(sdata['trade_history']) > 0:
+                    latest_trade = sdata['trade_history'][0]
+                    if latest_trade.get('status') == 'open':
+                        latest_trade['status'] = 'closed'
+                        latest_trade['close_time'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        latest_trade['close_reason'] = '全部平仓'
+        
+        if closed_symbols:
+            strategy_manager._save_strategies()
         
         return {
             "success": True,
@@ -1436,6 +1870,8 @@ async def websocket_endpoint(websocket: WebSocket, exchange_id: str, symbol: str
     # 用户数据推送任务 (持仓、订单)
     async def push_user_data():
         last_positions_count = -1  # 用于检测持仓变化
+        last_positions_hash = ""  # 用于检测持仓数据变化
+        last_orders_hash = ""  # 用于检测订单数据变化
         while True:
             try:
                 if exchange.apiKey:
@@ -1548,14 +1984,25 @@ async def websocket_endpoint(websocket: WebSocket, exchange_id: str, symbol: str
                         # 忽略委托查询错误，避免日志刷屏
                         pass
 
-                    if positions or orders:
-                        await websocket.send_json({
-                            'type': 'user_data',
-                            'positions': positions,
-                            'orders': orders
-                        })
+                    # 3. 只在数据真正变化时推送（减少前端重渲染）
+                    import hashlib
+                    import json
+                    
+                    current_positions_hash = hashlib.md5(json.dumps(positions, sort_keys=True).encode()).hexdigest()
+                    current_orders_hash = hashlib.md5(json.dumps(orders, sort_keys=True).encode()).hexdigest()
+                    
+                    # 只有在数据变化时才推送
+                    if current_positions_hash != last_positions_hash or current_orders_hash != last_orders_hash:
+                        if positions or orders or last_positions_hash or last_orders_hash:  # 确保清空时也推送一次
+                            await websocket.send_json({
+                                'type': 'user_data',
+                                'positions': positions,
+                                'orders': orders
+                            })
+                        last_positions_hash = current_positions_hash
+                        last_orders_hash = current_orders_hash
 
-                await asyncio.sleep(3.0) # 3秒轮询（优化：从1秒改为3秒，减少API压力）
+                await asyncio.sleep(5.0) # 5秒轮询（优化：从3秒改为5秒，前端已有深度比较）
             except Exception as e:
                 print(f"Push User Data Error: {e}")
                 await asyncio.sleep(3.0)

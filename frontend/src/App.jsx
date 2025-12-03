@@ -67,17 +67,25 @@ function App() {
     // 持仓与订单数据
     const [positions, setPositions] = useState([]);
     const [openOrders, setOpenOrders] = useState([]);
+    const [lastPositionsUpdate, setLastPositionsUpdate] = useState(0); // 最后更新时间戳
 
-    // 手动刷新持仓
+    // 手动刷新持仓（带防抖）
     const fetchPositions = async () => {
         try {
             const res = await axios.get(`http://localhost:8000/api/positions/${exchange}`);
             if (res.data && Array.isArray(res.data.positions)) {
-                setPositions(res.data.positions);
-                console.log(`刷新持仓: ${res.data.positions.length} 个`);
+                // 深度比较，避免相同数据触发更新
+                const newPositions = res.data.positions;
+                const hasChanged = JSON.stringify(positions) !== JSON.stringify(newPositions);
+
+                if (hasChanged) {
+                    setPositions(newPositions);
+                    setLastPositionsUpdate(Date.now());
+                    // console.log(`刷新持仓: ${newPositions.length} 个`);
+                }
             }
         } catch (e) {
-            console.error("Fetch positions failed:", e);
+            // console.error("Fetch positions failed:", e);
         }
     };
 
@@ -238,6 +246,7 @@ function App() {
     // ==================================================================
     const [strategies, setStrategies] = useState([]);
     const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+    const [deletingStrategyId, setDeletingStrategyId] = useState(null); // 正在删除的策略ID
     const [isCreatingStrategy, setIsCreatingStrategy] = useState(false);
     const [createForm] = Form.useForm();
 
@@ -274,10 +283,10 @@ function App() {
         return () => clearInterval(interval);
     }, []);
 
-    // 定期刷新持仓（即使WebSocket不在合约模式）
+    // 定期刷新持仓（WebSocket为主，轮询为辅）
     useEffect(() => {
         fetchPositions(); // 立即执行一次
-        const interval = setInterval(fetchPositions, 5000); // 每5秒刷新持仓（优化：从2秒改为5秒）
+        const interval = setInterval(fetchPositions, 10000); // 每10秒刷新持仓（WebSocket实时推送，轮询仅作备份）
         return () => clearInterval(interval);
     }, [exchange]);
 
@@ -317,16 +326,20 @@ function App() {
     };
 
     const handleStopStrategy = async (id) => {
+        setDeletingStrategyId(id); // 设置删除中状态
         try {
-            const res = await axios.post('http://localhost:8000/api/strategies/stop', { id });
+            const res = await axios.post('http://localhost:8000/api/strategies/stop', { id }, { timeout: 5000 });
             if (res.data.success) {
                 messageApi.success('策略已停止');
-                fetchStrategies();
+                // 立即从本地状态移除，不等待轮询
+                setStrategies(prev => prev.filter(s => s.id !== id));
             } else {
                 messageApi.error(res.data.message);
             }
         } catch (e) {
-            messageApi.error(e.message);
+            messageApi.error('删除失败: ' + e.message);
+        } finally {
+            setDeletingStrategyId(null); // 清除删除中状态
         }
     };
 
@@ -352,10 +365,22 @@ function App() {
         if (lastMessage !== null) {
             const data = JSON.parse(lastMessage.data);
 
-            // 处理 user_data (持仓和订单)
+            // 处理 user_data (持仓和订单) - 带防抖优化
             if (data.type === 'user_data') {
-                if (data.positions) setPositions(data.positions);
-                if (data.orders) setOpenOrders(data.orders);
+                if (data.positions) {
+                    // 深度比较，避免相同数据触发更新
+                    const hasChanged = JSON.stringify(positions) !== JSON.stringify(data.positions);
+                    if (hasChanged) {
+                        setPositions(data.positions);
+                        setLastPositionsUpdate(Date.now());
+                    }
+                }
+                if (data.orders) {
+                    const hasChanged = JSON.stringify(openOrders) !== JSON.stringify(data.orders);
+                    if (hasChanged) {
+                        setOpenOrders(data.orders);
+                    }
+                }
                 return;
             }
 
@@ -460,7 +485,15 @@ function App() {
     }, [lastMessage, timeframe]);
 
     const addLog = (msg, type = 'info') => {
-        setLogs(prev => [{ time: new Date().toLocaleTimeString(), msg, type }, ...prev].slice(0, 50));
+        // 防止重复日志（相同消息1秒内只记录一次）
+        setLogs(prev => {
+            const now = Date.now();
+            const lastLog = prev[0];
+            if (lastLog && lastLog.msg === msg && (now - (lastLog.timestamp || 0)) < 1000) {
+                return prev; // 忽略重复日志
+            }
+            return [{ time: new Date().toLocaleTimeString(), msg, type, timestamp: now }, ...prev].slice(0, 100); // 增加到100条
+        });
     };
 
     const handleTrade = (side) => {
@@ -541,13 +574,18 @@ function App() {
             )
         },
         {
-            title: '数量',
+            title: '方向/数量',
             dataIndex: 'amount',
             key: 'amount',
             render: (text, record) => (
-                <Text style={{ color: record.side === 'long' ? '#26a69a' : '#ef5350' }}>
-                    {record.side === 'long' ? '+' : '-'}{text}
-                </Text>
+                <Space direction="vertical" size={0}>
+                    <Tag color={record.side === 'long' ? 'green' : 'red'} style={{ margin: 0 }}>
+                        {record.side === 'long' ? '多' : '空'}
+                    </Tag>
+                    <Text style={{ color: '#fff', fontSize: 12 }}>
+                        {parseFloat(text).toFixed(4)}
+                    </Text>
+                </Space>
             )
         },
         {
@@ -819,17 +857,158 @@ function App() {
                                             </Space>
                                         </div>
                                         <div style={{ fontSize: 12 }}>
-                                            <div><Text type="secondary">状态: </Text><Tag color="green">运行中</Tag></div>
-                                            {item.last_signal && (
-                                                <div style={{ marginTop: 4 }}>
-                                                    <Text type="secondary">信号: </Text>
-                                                    <Text style={{ color: '#faad14' }}>{item.last_signal}</Text>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                                                <Text type="secondary">状态:</Text>
+                                                <Badge status="processing" text={<Text style={{ color: '#52c41a' }}>运行中</Text>} />
+                                            </div>
+
+                                            {/* 当前持仓信息 */}
+                                            {item.current_position && (
+                                                <div style={{
+                                                    padding: 8,
+                                                    background: '#1f1f1f',
+                                                    borderRadius: 4,
+                                                    marginBottom: 8,
+                                                    border: '1px solid #303030'
+                                                }}>
+                                                    <div style={{ marginBottom: 4 }}>
+                                                        <Tag color={item.current_position.side === 'buy' ? 'green' : 'red'}>
+                                                            {item.current_position.side === 'buy' ? '持多仓' : '持空仓'}
+                                                        </Tag>
+                                                        <Text style={{ color: '#fff', fontSize: 11, marginLeft: 8 }}>
+                                                            {item.current_position.quantity} @ {item.current_position.entry_price}
+                                                        </Text>
+                                                    </div>
+                                                    <div style={{ fontSize: 11 }}>
+                                                        <Text type="secondary">开仓: </Text>
+                                                        <Text style={{ color: '#bbb' }}>{item.current_position.entry_time}</Text>
+                                                    </div>
+                                                    <div style={{ fontSize: 11, marginTop: 2 }}>
+                                                        <Text type="secondary">止盈: </Text>
+                                                        <Text style={{ color: '#26a69a' }}>
+                                                            {item.current_position.tp_price ? item.current_position.tp_price.toFixed(2) : '已取消'}
+                                                        </Text>
+                                                        <Text type="secondary" style={{ marginLeft: 8 }}>止损: </Text>
+                                                        <Text style={{ color: '#ef5350' }}>{item.current_position.sl_price?.toFixed(2)}</Text>
+                                                        {item.current_position.trailing_stop_history && item.current_position.trailing_stop_history.length > 0 && (
+                                                            <Tag color="orange" style={{ marginLeft: 4, fontSize: 10, padding: '0 4px' }}>
+                                                                移动{item.current_position.trailing_stop_history.length}次
+                                                            </Tag>
+                                                        )}
+                                                    </div>
+
+                                                    {/* 移动止损历史 */}
+                                                    {item.current_position.trailing_stop_history && item.current_position.trailing_stop_history.length > 0 && (
+                                                        <div style={{
+                                                            marginTop: 6,
+                                                            paddingTop: 6,
+                                                            borderTop: '1px solid #262626',
+                                                            maxHeight: 100,
+                                                            overflowY: 'auto'
+                                                        }}>
+                                                            <Text type="secondary" style={{ fontSize: 10 }}>移动止损记录:</Text>
+                                                            {item.current_position.trailing_stop_history.slice(0, 3).map((record, idx) => (
+                                                                <div key={idx} style={{ fontSize: 10, marginTop: 2, color: '#888' }}>
+                                                                    • {record.time.split(' ')[1]} {record.old_sl.toFixed(2)} → {record.new_sl.toFixed(2)}
+                                                                    {record.candle_time && ` (4H ${record.candle_time.split(' ')[1]})`}
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    )}
                                                 </div>
                                             )}
+
+                                            {/* 最近交易决策 */}
+                                            {item.trade_history && item.trade_history.length > 0 && (
+                                                <div style={{
+                                                    padding: 8,
+                                                    background: '#1a1a1a',
+                                                    borderRadius: 4,
+                                                    border: '1px solid #262626',
+                                                    marginBottom: 8
+                                                }}>
+                                                    <Text strong style={{ color: '#faad14', fontSize: 11 }}>最近交易决策:</Text>
+                                                    {(() => {
+                                                        const latest = item.trade_history[0];
+                                                        const analysis = latest.analysis;
+                                                        return (
+                                                            <div style={{ marginTop: 4, fontSize: 11 }}>
+                                                                <div style={{ marginBottom: 2 }}>
+                                                                    <Text type="secondary">信号: </Text>
+                                                                    <Tag color={latest.signal_type === 'BUY' ? 'green' : 'red'} style={{ fontSize: 10, padding: '0 4px' }}>
+                                                                        {latest.signal_type === 'BUY' ? '做多' : '做空'}
+                                                                    </Tag>
+                                                                    <Text style={{ color: '#bbb', fontSize: 10, marginLeft: 4 }}>
+                                                                        {latest.signal_time}
+                                                                    </Text>
+                                                                </div>
+                                                                {analysis && (
+                                                                    <>
+                                                                        <div style={{ marginTop: 2 }}>
+                                                                            <Text type="secondary">共振: </Text>
+                                                                            <Text style={{ color: '#fff' }}>
+                                                                                {Object.values(analysis.confluence_found || {})[0]?.join(', ')}
+                                                                                ({analysis.signals_count?.long || analysis.signals_count?.short}/{analysis.required_confluence})
+                                                                            </Text>
+                                                                        </div>
+                                                                        {analysis.ratios && Object.keys(analysis.ratios).length > 0 && (
+                                                                            <div style={{ marginTop: 2 }}>
+                                                                                <Text type="secondary">形态: </Text>
+                                                                                <Text style={{ color: '#bbb', fontSize: 10 }}>
+                                                                                    {Object.entries(analysis.ratios).map(([tf, data]) =>
+                                                                                        `${tf}(影线/实体=${data.ratio}x)`
+                                                                                    ).join(', ')}
+                                                                                </Text>
+                                                                            </div>
+                                                                        )}
+                                                                    </>
+                                                                )}
+                                                                <div style={{ marginTop: 2 }}>
+                                                                    <Text type="secondary">成交: </Text>
+                                                                    <Text style={{ color: '#fff' }}>
+                                                                        {latest.quantity} @ {latest.entry_price}
+                                                                        ({latest.usdt_value?.toFixed(2)} USDT)
+                                                                    </Text>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })()}
+                                                </div>
+                                            )}
+
+                                            {/* 策略配置 */}
+                                            <div style={{ fontSize: 11 }}>
+                                                <Text type="secondary">保证金: </Text>
+                                                <Text style={{ color: '#faad14' }}>
+                                                    {item.config.amount} USDT
+                                                </Text>
+                                                <Text type="secondary" style={{ marginLeft: 8 }}>持仓价值: </Text>
+                                                <Text style={{ color: '#fff' }}>
+                                                    {(item.config.amount * item.config.leverage).toFixed(2)} USDT
+                                                </Text>
+                                            </div>
+                                            <div style={{ fontSize: 11, marginTop: 2 }}>
+                                                <Text type="secondary">杠杆: </Text>
+                                                <Text style={{ color: '#fff' }}>{item.config.leverage}x</Text>
+                                                <Text type="secondary" style={{ marginLeft: 8 }}>共振: </Text>
+                                                <Text style={{ color: '#fff' }}>{item.config.confluence}/3</Text>
+                                                <Text type="secondary" style={{ marginLeft: 8 }}>形态: </Text>
+                                                <Text style={{ color: '#fff' }}>{item.config.ratio}</Text>
+                                            </div>
                                         </div>
                                     </div>
-                                    <Popconfirm title="确定停止并删除?" onConfirm={() => handleStopStrategy(item.id)}>
-                                        <Button type="text" danger icon={<Trash2 />} size="small" />
+                                    <Popconfirm
+                                        title="确定停止并删除?"
+                                        onConfirm={() => handleStopStrategy(item.id)}
+                                        okButtonProps={{ loading: deletingStrategyId === item.id }}
+                                    >
+                                        <Button
+                                            type="text"
+                                            danger
+                                            icon={<Trash2 />}
+                                            size="small"
+                                            loading={deletingStrategyId === item.id}
+                                        />
                                     </Popconfirm>
                                 </div>
                             ))
@@ -909,12 +1088,28 @@ function App() {
                                     <Form.Item
                                         name="amount"
                                         label="单笔开仓金额 (USDT)"
+                                        help={
+                                            <div>
+                                                <div style={{ color: '#faad14' }}>💪 当前模式：保证金模式（充分利用杠杆）</div>
+                                                <div style={{ fontSize: 11, marginTop: 2 }}>
+                                                    例：10 USDT = 保证金10 USDT，持仓价值 10×5 = 50 USDT
+                                                </div>
+                                                <div style={{ fontSize: 11, color: '#ff4d4f', marginTop: 2 }}>
+                                                    ⚠️ 风险提示：杠杆放大盈亏，请控制仓位！
+                                                </div>
+                                            </div>
+                                        }
                                         rules={[
                                             { required: true, message: '请输入开仓金额' },
-                                            { type: 'number', min: 5, message: '币安合约最小金额为 5 USDT' }
+                                            { type: 'number', min: 5, message: '最小金额为 5 USDT' }
                                         ]}
                                     >
-                                        <InputNumber min={5} style={{ width: '100%' }} placeholder="最小 5 USDT" />
+                                        <InputNumber
+                                            min={5}
+                                            style={{ width: '100%' }}
+                                            placeholder="订单名义价值（非保证金）"
+                                            addonAfter="USDT"
+                                        />
                                     </Form.Item>
                                 </Col>
                             </Row>
@@ -1076,10 +1271,12 @@ function App() {
                                                     <Table
                                                         dataSource={positions}
                                                         columns={positionColumns}
-                                                        rowKey="symbol"
+                                                        rowKey={(record) => `${record.symbol}-${record.side || 'default'}`}
                                                         pagination={false}
                                                         locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="无持仓" /> }}
                                                         size="small"
+                                                        sticky
+                                                        bordered={false}
                                                     />
                                                     {positions.length > 0 && (
                                                         <div style={{ marginTop: 12, textAlign: 'center' }}>
