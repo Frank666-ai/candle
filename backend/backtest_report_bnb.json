@@ -1,0 +1,15 @@
+{
+  "symbol": "BNB/USDT",
+  "initial_balance": 100000,
+  "final_balance": 111739.83743451085,
+  "total_pnl": 11739.837434510742,
+  "total_return": 11.739837434510845,
+  "total_trades": 2713,
+  "winning_trades": 1279,
+  "losing_trades": 1434,
+  "win_rate": 47.14338370807224,
+  "avg_win": 61.38803859507246,
+  "avg_loss": -46.565874427187545,
+  "profit_factor": 1.175810645764527,
+  "max_drawdown": 1.6931509945164471
+}

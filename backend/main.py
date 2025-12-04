@@ -956,41 +956,63 @@ class StrategyManager:
                         try:
                             current_pos = strategy_data['current_position']
                             
-                            # 获取4H K线（用于移动止损）
-                            klines_4h = await exchange.fetch_ohlcv(symbol, '4h', limit=3)
-                            if klines_4h and len(klines_4h) >= 2:
-                                # 使用倒数第二根K线（已收盘确认）
-                                prev_4h_candle = klines_4h[-2]
-                                time_ms, open_p, high, low, close, volume = prev_4h_candle
+                            # 获取1H K线（用于移动止损）- 需要至少3根K线来判断走势
+                            klines_1h = await exchange.fetch_ohlcv(symbol, '1h', limit=3)
+                            if klines_1h and len(klines_1h) >= 3:
+                                # 最新一根K线（正在形成，用于判断价格走势）
+                                current_candle = klines_1h[-1]
+                                # 倒数第二根K线（已收盘，用作止损基准）
+                                prev_candle = klines_1h[-2]
+                                # 倒数第三根K线（用于比较判断是否走高）
+                                prev_prev_candle = klines_1h[-3]
+                                
+                                current_time, current_open, current_high, current_low, current_close, current_vol = current_candle
+                                prev_time, prev_open, prev_high, prev_low, prev_close, prev_vol = prev_candle
                                 
                                 current_sl = current_pos.get('sl_price', 0)
                                 new_sl = None
                                 should_update = False
                                 
+                                # 调试日志：打印K线信息
+                                print(f"[移动止损检查-{current_pos['side'].upper()}] 当前K线: 高{current_high:.2f} 低{current_low:.2f} | 前K线: 高{prev_high:.2f} 低{prev_low:.2f} | 当前止损: {current_sl:.2f}")
+                                
                                 if current_pos['side'] == 'buy':
-                                    # 做多：移动止损到4H K线最低点
-                                    new_sl = low
-                                    # 只有新止损更高时才移动（向上移动止损，保护利润）
-                                    if new_sl > current_sl:
-                                        should_update = True
-                                        reason = f"多单止损上移: {current_sl:.2f} → {new_sl:.2f} (4H低点)"
+                                    # 做多：检测价格是否走高（当前1H K线最高价 > 倒数第二根1H K线最高价）
+                                    if current_high > prev_high:
+                                        # 价格走高，移动止损到倒数第二根1H K线的最低点
+                                        new_sl = prev_low
+                                        # 只有新止损更高时才移动（向上移动止损，保护利润）
+                                        if new_sl > current_sl:
+                                            should_update = True
+                                            reason = f"多单止损上移(1H): {current_sl:.2f} → {new_sl:.2f} (当前1H走高至{current_high:.2f}，止损移至前1H低点{prev_low:.2f})"
+                                        else:
+                                            print(f"[移动止损-1H] 多单价格走高但止损未改善: 当前高点{current_high:.2f} > 前高{prev_high:.2f}，前低{prev_low:.2f} <= 当前止损{current_sl:.2f}")
+                                    else:
+                                        print(f"[移动止损-1H] 多单价格未走高: 当前高点{current_high:.2f} <= 前高{prev_high:.2f}")
+                                
                                 else:  # short
-                                    # 做空：移动止损到4H K线最高点
-                                    new_sl = high
-                                    # 只有新止损更低时才移动（向下移动止损，保护利润）
-                                    if new_sl < current_sl:
-                                        should_update = True
-                                        reason = f"空单止损下移: {current_sl:.2f} → {new_sl:.2f} (4H高点)"
+                                    # 做空：检测价格是否走低（当前1H K线最低价 < 倒数第二根1H K线最低价）
+                                    if current_low < prev_low:
+                                        # 价格走低，移动止损到倒数第二根1H K线的最高点
+                                        new_sl = prev_high
+                                        # 只有新止损更低时才移动（向下移动止损，保护利润）
+                                        if new_sl < current_sl:
+                                            should_update = True
+                                            reason = f"空单止损下移(1H): {current_sl:.2f} → {new_sl:.2f} (当前1H走低至{current_low:.2f}，止损移至前1H高点{prev_high:.2f})"
+                                        else:
+                                            print(f"[移动止损-1H] ⚠️ 空单价格走低但止损未改善: 当前低点{current_low:.2f} < 前低{prev_low:.2f}，但前高{prev_high:.2f} >= 当前止损{current_sl:.2f}，无法下移")
+                                    else:
+                                        print(f"[移动止损-1H] 空单价格未走低: 当前低点{current_low:.2f} >= 前低{prev_low:.2f}")
                                 
                                 if should_update:
-                                    print(f"[移动止损] {reason}")
+                                    print(f"[移动止损-1H] {reason}")
                                     
                                     # 1. 取消所有旧的委托单（止盈止损）
                                     try:
                                         await exchange.cancel_all_orders(symbol)
-                                        print(f"[移动止损] 已取消 {symbol} 的所有旧委托单")
+                                        print(f"[移动止损-1H] 已取消 {symbol} 的所有旧委托单")
                                     except Exception as cancel_err:
-                                        print(f"[移动止损] 取消委托失败: {cancel_err}")
+                                        print(f"[移动止损-1H] 取消委托失败: {cancel_err}")
                                     
                                     # 2. 设置新的移动止损（取消止盈，只保留止损）
                                     if exchange_id == 'binance':
@@ -1009,7 +1031,7 @@ class StrategyManager:
                                                 stopPrice=f"{new_sl:.2f}",
                                                 closePosition='true'
                                             )
-                                            print(f"[移动止损] ✓ 新止损已设置: {new_sl:.2f}")
+                                            print(f"[移动止损-1H] ✓ 新止损已设置: {new_sl:.2f}")
                                             
                                             # 更新策略数据
                                             current_pos['sl_price'] = new_sl
@@ -1018,9 +1040,12 @@ class StrategyManager:
                                                 'time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                                 'old_sl': current_sl,
                                                 'new_sl': new_sl,
-                                                'candle_time': datetime.datetime.fromtimestamp(time_ms/1000).strftime('%Y-%m-%d %H:%M'),
-                                                'candle_low': low if current_pos['side'] == 'buy' else None,
-                                                'candle_high': high if current_pos['side'] == 'short' else None
+                                                'prev_candle_time': datetime.datetime.fromtimestamp(prev_time/1000).strftime('%Y-%m-%d %H:%M'),
+                                                'current_candle_time': datetime.datetime.fromtimestamp(current_time/1000).strftime('%Y-%m-%d %H:%M'),
+                                                'prev_candle_low': prev_low if current_pos['side'] == 'buy' else None,
+                                                'prev_candle_high': prev_high if current_pos['side'] == 'short' else None,
+                                                'current_high': current_high if current_pos['side'] == 'buy' else None,
+                                                'current_low': current_low if current_pos['side'] == 'short' else None
                                             })
                                             
                                             # 保存到文件
@@ -1034,7 +1059,7 @@ class StrategyManager:
                                                 "level": "success"
                                             })
                                         except Exception as sl_err:
-                                            print(f"[移动止损] ✗ 设置失败: {sl_err}")
+                                            print(f"[移动止损-1H] ✗ 设置失败: {sl_err}")
                         except Exception as trailing_err:
                             # 移动止损失败不影响策略运行
                             pass

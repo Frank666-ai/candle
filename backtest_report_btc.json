@@ -1,0 +1,16 @@
+{
+  "symbol": "BTC/USDT",
+  "initial_balance": 100000,
+  "final_balance": 405639.4327600084,
+  "total_pnl": 305639.43276000576,
+  "total_return": 305.63943276000833,
+  "total_trades": 3416,
+  "winning_trades": 1492,
+  "losing_trades": 1924,
+  "win_rate": 43.676814988290396,
+  "avg_win": 3016.788179859879,
+  "avg_loss": -2180.5657648601527,
+  "profit_factor": 1.0728509346488135,
+  "max_drawdown": 48.33891111196134,
+  "trailing_stop_count": 471
+}

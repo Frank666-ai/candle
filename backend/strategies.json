@@ -1,5 +1,5 @@
 {
-  "9937e151-f8f4-4b6c-aca2-1e20e0c58813": {
+  "74c123f6-5348-4138-a330-ccb033520552": {
     "config": {
       "exchange": "binance",
       "symbol": "BNB/USDT",
@@ -9,25 +9,25 @@
       "confluence": 2,
       "tp": 1.5,
       "sl": 1,
-      "leverage": 5,
-      "amount": 10
+      "leverage": 3,
+      "amount": 30
     },
-    "start_time": "2025-12-04T00:03:02.974095",
+    "start_time": "2025-12-04T11:58:52.856133",
     "status": "running",
-    "last_processed_time": 1764777600000,
-    "last_signal": "BUY @ 2025-12-04 00:00:00",
+    "last_processed_time": 1764820800000,
+    "last_signal": "SELL @ 2025-12-04 12:00:00",
     "trade_history": [
       {
-        "signal_time": "2025-12-04 00:00:00",
-        "signal_type": "BUY",
-        "entry_price": 899.55,
-        "entry_time": "2025-12-04 01:00:12",
-        "quantity": 0.01,
-        "usdt_value": 8.9955,
-        "leverage": 5,
-        "tp_price": 908.8049999999998,
-        "sl_price": 893.38,
-        "order_id": 82035605898,
+        "signal_time": "2025-12-04 12:00:00",
+        "signal_type": "SELL",
+        "entry_price": 913.83,
+        "entry_time": "2025-12-04 13:00:13",
+        "quantity": 0.09,
+        "usdt_value": 82.2447,
+        "leverage": 3,
+        "tp_price": 905.0250000000001,
+        "sl_price": 919.7,
+        "order_id": 82064358007,
         "analysis": {
           "timeframes_checked": [
             "1h",
@@ -35,9 +35,6 @@
             "1d"
           ],
           "confluence_found": {
-            "long": [
-              "1h"
-            ],
             "short": [
               "1h"
             ]
@@ -45,57 +42,51 @@
           "ratios": {
             "1h": {
               "type": "Shooting Star做空",
-              "upper_wick": 4.240000000000009,
-              "body": 1.9599999999999227,
-              "ratio": 2.16
+              "upper_wick": 2.4400000000000546,
+              "body": 3.42999999999995,
+              "ratio": 0.71
             },
             "4h": {
               "type": "Shooting Star做空",
-              "upper_wick": 7.259999999999991,
-              "body": 1.7200000000000273,
-              "ratio": 4.22
+              "upper_wick": 7.689999999999941,
+              "body": 3.9200000000000728,
+              "ratio": 1.96
             }
           },
           "prices": {
             "1h": {
-              "open": 897.72,
-              "high": 903.92,
-              "low": 893.38,
-              "close": 899.68,
-              "time": "2025-12-04 00:00"
+              "open": 917.26,
+              "high": 919.7,
+              "low": 913.15,
+              "close": 913.83,
+              "time": "2025-12-04 12:00"
             },
             "4h": {
-              "open": 899.44,
-              "high": 906.7,
-              "low": 888.42,
-              "close": 897.72,
-              "time": "2025-12-03 20:00"
+              "open": 921.19,
+              "high": 928.88,
+              "low": 915.41,
+              "close": 917.27,
+              "time": "2025-12-04 08:00"
             },
             "1d": {
-              "open": 826.46,
-              "high": 885.5,
-              "low": 820.2,
-              "close": 877.18,
-              "time": "2025-12-02 08:00"
+              "open": 877.18,
+              "high": 923.12,
+              "low": 874.0,
+              "close": 921.19,
+              "time": "2025-12-03 08:00"
             }
           },
           "required_confluence": 2,
           "signals_count": {
-            "long": 2,
+            "long": 0,
             "short": 2
           }
         },
-        "status": "open"
+        "status": "closed",
+        "close_time": "2025-12-04 13:00:14",
+        "close_reason": "止损/止盈触发"
       }
     ],
-    "current_position": {
-      "symbol": "BNB/USDT",
-      "side": "buy",
-      "entry_price": 899.55,
-      "entry_time": "2025-12-04 01:00:12",
-      "quantity": 0.01,
-      "tp_price": 908.8049999999998,
-      "sl_price": 893.38
-    }
+    "current_position": null
   }
 }
